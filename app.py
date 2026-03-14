@@ -1,6 +1,5 @@
 from flask import Flask, jsonify
 import os
-import time
 from datetime import datetime, timezone, timedelta
 import httpx
 from supabase import create_client
@@ -18,11 +17,11 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "1"))
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 def check_deliveries():
-    """Check all recent deliveries and verify if new image arrived in gallery"""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
+    """Check deliveries - look for matching delivery_id in gallery"""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
     
     try:
-        # Get deliveries from last 10 minutes
+        # Get recent deliveries
         response = supabase.table('deliveries').select('*').gte('created_at', cutoff.isoformat()).execute()
         deliveries = response.data or []
         
@@ -33,50 +32,52 @@ def check_deliveries():
             credits_used = d['credits_used']
             delivery_id = d['id']
             status = d.get('status', 'unknown')
-            created_at = d.get('created_at', '')
             
             # Skip if already failed
             if status == 'failed':
+                print(f"[Monitor] Delivery {delivery_id}: Already failed, skipping")
                 continue
             
-            # Get delivery timestamp
-            try:
-                dt = datetime.fromisoformat(created_at.replace('+00:00', '').replace('Z', ''))
-                delivery_ts = dt.timestamp()
-            except:
-                delivery_ts = 0
-            
-            # Check gallery
+            # Check gallery for this delivery_id
             try:
                 resp = httpx.get(f"{STORAGE_PROXY_URL}/user-gallery?user_id={user_id}", timeout=10)
                 if resp.status_code == 200:
                     gallery = resp.json()
                     
-                    # Is there an image AFTER this delivery?
-                    new_images = [img for img in gallery if img.get('timestamp', 0) > delivery_ts]
+                    # Look for image with matching delivery_id
+                    matching = [img for img in gallery if img.get('delivery_id') == delivery_id]
                     
-                    if new_images:
-                        print(f"[Monitor] Delivery {delivery_id}: SUCCESS - Image found")
+                    if matching:
+                        print(f"[Monitor] Delivery {delivery_id}: SUCCESS - Found image with delivery_id")
                         if status != 'delivered':
                             supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
                     else:
-                        print(f"[Monitor] Delivery {delivery_id}: FAIL - No new image")
-                        handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
+                        # Check if enough time has passed
+                        created = d.get('created_at', '')
+                        try:
+                            dt = datetime.fromisoformat(created.replace('+00:00', '').replace('Z', ''))
+                            mins = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+                        except:
+                            mins = 0
+                        
+                        if mins >= DELIVERY_TIMEOUT_MINUTES:
+                            print(f"[Monitor] Delivery {delivery_id}: FAIL - No image with delivery_id found after {mins} min")
+                            handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
+                        else:
+                            print(f"[Monitor] Delivery {delivery_id}: Waiting... ({mins:.1f} min)")
                 else:
                     print(f"[Monitor] Error checking gallery: {resp.status_code}")
             except Exception as e:
                 print(f"[Monitor] Error: {e}")
-
+                
     except Exception as e:
         print(f"[Monitor] Fatal: {e}")
 
 def handle_failure(user_id, credits_used, delivery_id, message):
     """Register error and refund credits"""
     try:
-        # Mark as failed first
         supabase.table('deliveries').update({'status': 'failed'}).eq('id', delivery_id).execute()
         
-        # Call refund
         httpx.post(f"{STORAGE_PROXY_URL}/user-gallery/error", json={
             "user_id": user_id,
             "error_message": message,
