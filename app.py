@@ -94,10 +94,8 @@ def handle_failure(user_id, credits_used, delivery_id, message):
 def debug():
     """Debug - show recent deliveries"""
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-        
-        # Get ALL deliveries from last 15 min
-        response = supabase.table('deliveries').select('*').gte('created_at', cutoff.isoformat()).order('created_at', desc=True).execute()
+        # Get ALL deliveries regardless of time
+        response = supabase.table('deliveries').select('*').order('created_at', desc=True).limit(10).execute()
         deliveries = response.data or []
         
         result = []
