@@ -129,6 +129,32 @@ def check_now():
     return jsonify({"status": "triggered"})
 
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Debug endpoint to check deliveries"""
+    try:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
+        cutoff_iso = cutoff_dt.isoformat()
+        
+        # Get all processing deliveries
+        response = supabase.table('deliveries').select('*').eq('status', 'processing').execute()
+        processing = response.data if response.data else []
+        
+        # Get old deliveries that should have failed
+        old_response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
+        old_deliveries = old_response.data if old_response.data else []
+        
+        return jsonify({
+            "status": "ok",
+            "total_processing": len(processing),
+            "should_fail": len(old_deliveries),
+            "cutoff_time": cutoff_iso,
+            "deliveries": old_deliveries[:5]  # First 5
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # Start scheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_deliveries, 'interval', minutes=CHECK_INTERVAL_MINUTES, id='delivery_check')
