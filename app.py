@@ -80,6 +80,15 @@ def check_deliveries():
 
 def handle_failure(user_id, credits_used, delivery_id, error_message):
     """Register error and refund credits"""
+    
+    # FIRST: Mark as failed to prevent duplicate processing
+    try:
+        supabase.table('deliveries').update({'status': 'failed'}).eq('id', delivery_id).execute()
+        print(f"[Monitor] Marked delivery {delivery_id} as failed")
+    except Exception as e:
+        print(f"[Monitor] Error marking delivery as failed: {e}")
+    
+    # SECOND: Try to refund credits and log error
     try:
         # Call storage-proxy error endpoint
         error_data = {
@@ -97,16 +106,10 @@ def handle_failure(user_id, credits_used, delivery_id, error_message):
             refund_status = result.get('refund', 'unknown')
             print(f"[Monitor] Delivery {delivery_id}: FAILED - Refunded {credits_used} credits (status: {refund_status})")
         else:
-            print(f"[Monitor] Delivery {delivery_id}: ERROR calling refund endpoint: {resp.status_code}")
+            print(f"[Monitor] Delivery {delivery_id}: ERROR calling refund endpoint: {resp.status_code} - {resp.text}")
             
     except Exception as e:
         print(f"[Monitor] Error in handle_failure: {e}")
-    
-    try:
-        # Update delivery status
-        supabase.table('deliveries').update({'status': 'failed'}).eq('id', delivery_id).execute()
-    except Exception as e:
-        print(f"[Monitor] Error updating delivery status: {e}")
 
 
 @app.route("/health")
