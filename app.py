@@ -150,25 +150,26 @@ def debug():
         cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
         cutoff_iso = cutoff_dt.isoformat()
         
-        # Get all processing deliveries
-        response = supabase.table('deliveries').select('*').eq('status', 'processing').execute()
-        processing = response.data if response.data else []
+        # Get ALL recent deliveries regardless of status
+        all_response = supabase.table('deliveries').select('*').order('created_at', desc=True).limit(20).execute()
+        all_deliveries = all_response.data if all_response.data else []
         
-        # Get old deliveries that should have failed
+        # Get processing deliveries
+        processing_response = supabase.table('deliveries').select('*').eq('status', 'processing').execute()
+        processing = processing_response.data if processing_response.data else []
+        
+        # Get old processing that should fail
         old_response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
         old_deliveries = old_response.data if old_response.data else []
         
-        # Get failed deliveries
-        failed_response = supabase.table('deliveries').select('*').eq('status', 'failed').order('created_at', desc=True).limit(5).execute()
-        failed = failed_response.data if failed_response.data else []
-        
         return jsonify({
             "status": "ok",
-            "total_processing": len(processing),
+            "total_deliveries": len(all_deliveries),
+            "processing": len(processing),
             "should_fail": len(old_deliveries),
             "cutoff_time": cutoff_iso,
-            "processing_deliveries": processing,
-            "failed_deliveries": failed
+            "all_deliveries": all_deliveries[:10],
+            "old_processing": old_deliveries
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
