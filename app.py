@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 import os
 import time
+from datetime import datetime, timezone, timedelta
 import httpx
 from supabase import create_client
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,22 +20,29 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 def check_deliveries():
     """Check pending deliveries and verify if images arrived"""
-    cutoff_time = time.time() - (DELIVERY_TIMEOUT_MINUTES * 60)
+    # Use proper ISO timestamp for Supabase comparison
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
+    cutoff_iso = cutoff_dt.isoformat()
+    
+    print(f"[Monitor] Checking for deliveries older than {cutoff_iso}...")
     
     try:
         # Get pending deliveries older than timeout
-        response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_time).execute()
+        response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
         pending = response.data if response.data else []
+        
+        print(f"[Monitor] Found {len(pending)} pending deliveries older than {DELIVERY_TIMEOUT_MINUTES} minutes")
         
         if not pending:
             return
-            
-        print(f"[Monitor] Checking {len(pending)} pending deliveries...")
         
         for delivery in pending:
             user_id = delivery['user_id']
             credits_used = delivery['credits_used']
             delivery_id = delivery['id']
+            created_at = delivery.get('created_at', '')
+            
+            print(f"[Monitor] Checking delivery {delivery_id} for user {user_id}, created at {created_at}")
             
             # Check if image exists in personal gallery
             try:
@@ -43,17 +51,23 @@ def check_deliveries():
                 if gallery_resp.status_code == 200:
                     gallery = gallery_resp.json()
                     
-                    # Check if any image is recent (within processing time - 10 min buffer)
-                    buffer_time = cutoff_time - (10 * 60)
-                    recent_images = [img for img in gallery if img.get('timestamp', 0) > buffer_time]
-                    
-                    if recent_images:
-                        # Image arrived - mark as delivered
-                        supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
-                        print(f"[Monitor] Delivery {delivery_id}: SUCCESS")
+                    # Check if there are any images at all for this user
+                    if not gallery or len(gallery) == 0:
+                        print(f"[Monitor] No images in gallery for user {user_id}")
+                        handle_failure(user_id, credits_used, delivery_id, "No se encontró ninguna imagen en galería personal")
                     else:
-                        # No recent image - mark as failed and refund
-                        handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
+                        # Get most recent image timestamp
+                        latest_timestamp = max([img.get('timestamp', 0) for img in gallery])
+                        print(f"[Monitor] Latest image timestamp: {latest_timestamp}")
+                        
+                        # Check if any image is newer than the delivery
+                        delivery_time = delivery.get('timestamp', 0)
+                        if delivery_time and latest_timestamp > delivery_time:
+                            # Image arrived - mark as delivered
+                            supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
+                            print(f"[Monitor] Delivery {delivery_id}: SUCCESS")
+                        else:
+                            handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
                 else:
                     handle_failure(user_id, credits_used, delivery_id, f"Error al verificar galería: {gallery_resp.status_code}")
             except Exception as e:
