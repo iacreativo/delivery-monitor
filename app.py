@@ -20,40 +20,31 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 def check_deliveries():
     """Check pending deliveries and verify if images arrived"""
-    # Get deliveries from the last 30 minutes
-    cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=30)
+    # Look for deliveries that are processing for more than X minutes
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
     cutoff_iso = cutoff_dt.isoformat()
     
-    print(f"[Monitor] Checking deliveries from last 30 minutes...")
+    print(f"[Monitor] Checking deliveries older than {DELIVERY_TIMEOUT_MINUTES} minutes...")
     
     try:
-        # Get recent deliveries regardless of status
-        response = supabase.table('deliveries').select('*').gt('created_at', cutoff_iso).order('created_at', desc=True).execute()
-        recent = response.data if response.data else []
+        # Get deliveries with status 'processing' older than timeout
+        response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
+        pending = response.data if response.data else []
         
-        print(f"[Monitor] Found {len(recent)} recent deliveries")
+        print(f"[Monitor] Found {len(pending)} deliveries in 'processing' status older than {DELIVERY_TIMEOUT_MINUTES} min")
         
-        if not recent:
+        if not pending:
+            # Also check deliveries marked as 'delivered' that might not have actual images
+            print(f"[Monitor] No processing deliveries. Checking delivered ones...")
             return
         
-        for delivery in recent:
+        for delivery in pending:
             user_id = delivery['user_id']
             credits_used = delivery['credits_used']
             delivery_id = delivery['id']
             created_at = delivery.get('created_at', '')
-            status = delivery.get('status', 'processing')
             
-            # Calculate how long ago this delivery was created
-            try:
-                if '+' in created_at:
-                    delivery_time = datetime.fromisoformat(created_at.replace('+00:00', ''))
-                else:
-                    delivery_time = datetime.fromisoformat(created_at)
-                minutes_ago = (datetime.now(timezone.utc) - delivery_time).total_seconds() / 60
-            except:
-                minutes_ago = 0
-            
-            print(f"[Monitor] Delivery {delivery_id}: status={status}, {minutes_ago:.1f} min ago")
+            print(f"[Monitor] Checking delivery {delivery_id} for user {user_id}")
             
             # Check if image exists in personal gallery
             try:
@@ -62,42 +53,42 @@ def check_deliveries():
                 if gallery_resp.status_code == 200:
                     gallery = gallery_resp.json()
                     
-                    # Find images created AFTER this delivery
-                    delivery_timestamp = 0
-                    try:
-                        if '+' in created_at:
-                            delivery_timestamp = datetime.fromisoformat(created_at.replace('+00:00', '')).timestamp()
-                        else:
-                            delivery_timestamp = datetime.fromisoformat(created_at).timestamp()
-                    except:
-                        delivery_timestamp = 0
-                    
-                    # Check if there's any image newer than this delivery
-                    recent_images = [img for img in gallery if img.get('timestamp', 0) > delivery_timestamp]
-                    
-                    if recent_images:
-                        # Image exists - if status is not delivered, update it
-                        if status != 'delivered':
-                            supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
-                            print(f"[Monitor] Delivery {delivery_id}: Marked as SUCCESS")
+                    if not gallery or len(gallery) == 0:
+                        print(f"[Monitor] NO IMAGES in gallery for user {user_id}")
+                        handle_failure(user_id, credits_used, delivery_id, "No se encontró ninguna imagen en galería personal")
                     else:
-                        # No image found for this delivery
-                        if minutes_ago > 6:  # More than 6 minutes old
-                            # Only mark as failed if it's old enough
-                            if status != 'failed':
-                                handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
+                        # Get the most recent image timestamp
+                        latest = max([img.get('timestamp', 0) for img in gallery])
+                        
+                        # Get delivery timestamp
+                        delivery_ts = 0
+                        try:
+                            if '+' in created_at:
+                                dt = datetime.fromisoformat(created_at.replace('+00:00', ''))
                             else:
-                                print(f"[Monitor] Delivery {delivery_id}: Already marked as failed")
+                                dt = datetime.fromisoformat(created_at)
+                            delivery_ts = dt.timestamp()
+                        except:
+                            delivery_ts = 0
+                        
+                        print(f"[Monitor] Delivery time: {delivery_ts}, Latest image: {latest}")
+                        
+                        # If latest image is AFTER delivery, it's good. Otherwise fail.
+                        if latest > delivery_ts:
+                            # Image arrived after delivery - good!
+                            print(f"[Monitor] SUCCESS - Image found")
                         else:
-                            print(f"[Monitor] Delivery {delivery_id}: Still waiting ({minutes_ago:.1f} min)")
+                            print(f"[Monitor] FAIL - No new image found")
+                            handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
                 else:
-                    print(f"[Monitor] Error checking gallery: {gallery_resp.status_code}")
+                    handle_failure(user_id, credits_used, delivery_id, f"Error verificando galería: {gallery_resp.status_code}")
                     
             except Exception as e:
-                print(f"[Monitor] Error checking delivery {delivery_id}: {e}")
+                print(f"[Monitor] Error: {e}")
+                handle_failure(user_id, credits_used, delivery_id, f"Error de conexión: {str(e)}")
                 
     except Exception as e:
-        print(f"[Monitor] Fatal error in check_deliveries: {e}")
+        print(f"[Monitor] Fatal error: {e}")
 
 
 def handle_failure(user_id, credits_used, delivery_id, error_message):
