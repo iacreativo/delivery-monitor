@@ -8,188 +8,101 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# Config from environment
+# Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 STORAGE_PROXY_URL = os.getenv("STORAGE_PROXY_URL", "https://storage.vyzo.cloud")
-DELIVERY_TIMEOUT_MINUTES = int(os.getenv("DELIVERY_TIMEOUT_MINUTES", "6"))
+DELIVERY_TIMEOUT_MINUTES = int(os.getenv("DELIVERY_TIMEOUT_MINUTES", "3"))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "1"))
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-
 def check_deliveries():
-    """Check deliveries and verify if images arrived in gallery"""
-    # Get deliveries from the last 10 minutes
-    cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=10)
-    cutoff_iso = cutoff_dt.isoformat()
-    
-    print(f"[Monitor] Checking deliveries from last 10 minutes...")
+    """Check all recent deliveries and verify if new image arrived in gallery"""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
     
     try:
-        # Get recent deliveries regardless of status
-        response = supabase.table('deliveries').select('*').gte('created_at', cutoff_iso).execute()
-        recent = response.data if response.data else []
+        # Get deliveries from last 10 minutes
+        response = supabase.table('deliveries').select('*').gte('created_at', cutoff.isoformat()).execute()
+        deliveries = response.data or []
         
-        print(f"[Monitor] Found {len(recent)} recent deliveries")
+        print(f"[Monitor] Checking {len(deliveries)} recent deliveries...")
         
-        if not recent:
-            return
-        
-        for delivery in recent:
-            user_id = delivery['user_id']
-            credits_used = delivery['credits_used']
-            delivery_id = delivery['id']
-            created_at = delivery.get('created_at', '')
-            status = delivery.get('status', 'unknown')
+        for d in deliveries:
+            user_id = d['user_id']
+            credits_used = d['credits_used']
+            delivery_id = d['id']
+            status = d.get('status', 'unknown')
+            created_at = d.get('created_at', '')
             
-            # Calculate minutes ago
-            try:
-                if '+' in created_at:
-                    dt = datetime.fromisoformat(created_at.replace('+00:00', ''))
-                else:
-                    dt = datetime.fromisoformat(created_at)
-                minutes_ago = (datetime.now(timezone.utc) - dt).total_seconds() / 60
-            except:
-                minutes_ago = 0
-            
-            print(f"[Monitor] Delivery {delivery_id}: status={status}, {minutes_ago:.1f} min ago")
-            
-            # Skip if already marked as failed
+            # Skip if already failed
             if status == 'failed':
-                print(f"[Monitor] Skipping - already failed")
                 continue
             
-            # Check gallery for this user
+            # Get delivery timestamp
             try:
-                gallery_resp = httpx.get(f"{STORAGE_PROXY_URL}/user-gallery?user_id={user_id}", timeout=15)
-                
-                if gallery_resp.status_code == 200:
-                    gallery = gallery_resp.json()
+                dt = datetime.fromisoformat(created_at.replace('+00:00', '').replace('Z', ''))
+                delivery_ts = dt.timestamp()
+            except:
+                delivery_ts = 0
+            
+            # Check gallery
+            try:
+                resp = httpx.get(f"{STORAGE_PROXY_URL}/user-gallery?user_id={user_id}", timeout=10)
+                if resp.status_code == 200:
+                    gallery = resp.json()
                     
-                    # Get delivery timestamp
-                    delivery_ts = 0
-                    try:
-                        if '+' in created_at:
-                            delivery_ts = datetime.fromisoformat(created_at.replace('+00:00', '')).timestamp()
-                        else:
-                            delivery_ts = datetime.fromisoformat(created_at).timestamp()
-                    except:
-                        delivery_ts = 0
+                    # Is there an image AFTER this delivery?
+                    new_images = [img for img in gallery if img.get('timestamp', 0) > delivery_ts]
                     
-                    # Check if there's any image AFTER this delivery
-                    images_after = [img for img in gallery if img.get('timestamp', 0) > delivery_ts]
-                    
-                    if images_after:
-                        print(f"[Monitor] SUCCESS - Image found in gallery")
-                        # Update status if not delivered
+                    if new_images:
+                        print(f"[Monitor] Delivery {delivery_id}: SUCCESS - Image found")
                         if status != 'delivered':
                             supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
                     else:
-                        print(f"[Monitor] FAIL - No image found in gallery after delivery")
-                        # Only fail if enough time has passed
-                        if minutes_ago >= DELIVERY_TIMEOUT_MINUTES:
-                            handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
-                        else:
-                            print(f"[Monitor] Still waiting... ({minutes_ago:.1f} min)")
+                        print(f"[Monitor] Delivery {delivery_id}: FAIL - No new image")
+                        handle_failure(user_id, credits_used, delivery_id, "No se recibió imagen en galería personal")
                 else:
-                    print(f"[Monitor] Error checking gallery: {gallery_resp.status_code}")
-                    
+                    print(f"[Monitor] Error checking gallery: {resp.status_code}")
             except Exception as e:
                 print(f"[Monitor] Error: {e}")
-                
+
     except Exception as e:
-        print(f"[Monitor] Fatal error: {e}")
+        print(f"[Monitor] Fatal: {e}")
 
-
-def handle_failure(user_id, credits_used, delivery_id, error_message):
+def handle_failure(user_id, credits_used, delivery_id, message):
     """Register error and refund credits"""
-    
-    # FIRST: Mark as failed to prevent duplicate processing
     try:
+        # Mark as failed first
         supabase.table('deliveries').update({'status': 'failed'}).eq('id', delivery_id).execute()
-        print(f"[Monitor] Marked delivery {delivery_id} as failed")
-    except Exception as e:
-        print(f"[Monitor] Error marking delivery as failed: {e}")
-    
-    # SECOND: Try to refund credits and log error
-    try:
-        # Call storage-proxy error endpoint
-        error_data = {
+        
+        # Call refund
+        httpx.post(f"{STORAGE_PROXY_URL}/user-gallery/error", json={
             "user_id": user_id,
-            "error_message": f"Error en procesamiento: {error_message}",
+            "error_message": message,
             "refund_credits": True,
             "credits_amount": credits_used,
             "execution_id": delivery_id
-        }
+        }, timeout=15)
         
-        resp = httpx.post(f"{STORAGE_PROXY_URL}/user-gallery/error", json=error_data, timeout=15)
-        
-        if resp.status_code == 200:
-            result = resp.json()
-            refund_status = result.get('refund', 'unknown')
-            print(f"[Monitor] Delivery {delivery_id}: FAILED - Refunded {credits_used} credits (status: {refund_status})")
-        else:
-            print(f"[Monitor] Delivery {delivery_id}: ERROR calling refund endpoint: {resp.status_code} - {resp.text}")
-            
+        print(f"[Monitor] Delivery {delivery_id}: FAILED - Refunded {credits_used} credits")
     except Exception as e:
-        print(f"[Monitor] Error in handle_failure: {e}")
-
+        print(f"[Monitor] Handle failure error: {e}")
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok", 
-        "service": "delivery-monitor",
-        "timeout_minutes": DELIVERY_TIMEOUT_MINUTES,
-        "check_interval_minutes": CHECK_INTERVAL_MINUTES
-    })
-
+    return jsonify({"status": "ok", "timeout": DELIVERY_TIMEOUT_MINUTES, "interval": CHECK_INTERVAL_MINUTES})
 
 @app.route("/check-now", methods=["POST"])
 def check_now():
-    """Manual trigger for checking deliveries"""
     check_deliveries()
     return jsonify({"status": "triggered"})
 
-
-@app.route("/debug", methods=["GET"])
-def debug():
-    """Debug endpoint to check deliveries"""
-    try:
-        cutoff_dt = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_TIMEOUT_MINUTES)
-        cutoff_iso = cutoff_dt.isoformat()
-        
-        # Get ALL recent deliveries regardless of status
-        all_response = supabase.table('deliveries').select('*').order('created_at', desc=True).limit(20).execute()
-        all_deliveries = all_response.data if all_response.data else []
-        
-        # Get processing deliveries
-        processing_response = supabase.table('deliveries').select('*').eq('status', 'processing').execute()
-        processing = processing_response.data if processing_response.data else []
-        
-        # Get old processing that should fail
-        old_response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
-        old_deliveries = old_response.data if old_response.data else []
-        
-        return jsonify({
-            "status": "ok",
-            "total_deliveries": len(all_deliveries),
-            "processing": len(processing),
-            "should_fail": len(old_deliveries),
-            "cutoff_time": cutoff_iso,
-            "all_deliveries": all_deliveries[:10],
-            "old_processing": old_deliveries
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 # Start scheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(check_deliveries, 'interval', minutes=CHECK_INTERVAL_MINUTES, id='delivery_check')
+scheduler.add_job(check_deliveries, 'interval', minutes=CHECK_INTERVAL_MINUTES)
 scheduler.start()
-print(f"[Monitor] Started - checking every {CHECK_INTERVAL_MINUTES} minute(s), timeout at {DELIVERY_TIMEOUT_MINUTES} minutes")
+print(f"[Monitor] Started - check every {CHECK_INTERVAL_MINUTES} min, timeout {DELIVERY_TIMEOUT_MINUTES} min")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)
