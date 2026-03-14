@@ -60,9 +60,23 @@ def check_deliveries():
                         latest_timestamp = max([img.get('timestamp', 0) for img in gallery])
                         print(f"[Monitor] Latest image timestamp: {latest_timestamp}")
                         
-                        # Check if any image is newer than the delivery
-                        delivery_time = delivery.get('timestamp', 0)
-                        if delivery_time and latest_timestamp > delivery_time:
+                        # Check if any image is newer than the delivery - use created_at
+                        delivery_created = delivery.get('created_at', '')
+                        if delivery_created:
+                            # Parse the ISO timestamp
+                            try:
+                                if '+' in delivery_created:
+                                    delivery_time = datetime.fromisoformat(delivery_created.replace('+00:00', '')).timestamp()
+                                else:
+                                    delivery_time = datetime.fromisoformat(delivery_created).timestamp()
+                            except:
+                                delivery_time = 0
+                        else:
+                            delivery_time = 0
+                            
+                        print(f"[Monitor] Delivery time: {delivery_time}, Latest image: {latest_timestamp}")
+                        
+                        if latest_timestamp > delivery_time:
                             # Image arrived - mark as delivered
                             supabase.table('deliveries').update({'status': 'delivered'}).eq('id', delivery_id).execute()
                             print(f"[Monitor] Delivery {delivery_id}: SUCCESS")
@@ -144,12 +158,17 @@ def debug():
         old_response = supabase.table('deliveries').select('*').eq('status', 'processing').lt('created_at', cutoff_iso).execute()
         old_deliveries = old_response.data if old_response.data else []
         
+        # Get failed deliveries
+        failed_response = supabase.table('deliveries').select('*').eq('status', 'failed').order('created_at', desc=True).limit(5).execute()
+        failed = failed_response.data if failed_response.data else []
+        
         return jsonify({
             "status": "ok",
             "total_processing": len(processing),
             "should_fail": len(old_deliveries),
             "cutoff_time": cutoff_iso,
-            "deliveries": old_deliveries[:5]  # First 5
+            "processing_deliveries": processing,
+            "failed_deliveries": failed
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
