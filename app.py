@@ -90,6 +90,39 @@ def handle_failure(user_id, credits_used, delivery_id, message):
     except Exception as e:
         print(f"[Monitor] Handle failure error: {e}")
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Debug - show recent deliveries"""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        
+        # Get ALL deliveries from last 15 min
+        response = supabase.table('deliveries').select('*').gte('created_at', cutoff.isoformat()).order('created_at', desc=True).execute()
+        deliveries = response.data or []
+        
+        result = []
+        for d in deliveries:
+            created = d.get('created_at', '')
+            try:
+                dt = datetime.fromisoformat(created.replace('+00:00', '').replace('Z', ''))
+                mins_ago = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+            except:
+                mins_ago = 0
+                
+            result.append({
+                "id": str(d.get('id', ''))[:8],
+                "status": d.get('status'),
+                "credits": d.get('credits_used'),
+                "mins_ago": round(mins_ago, 1)
+            })
+        
+        return jsonify({
+            "deliveries": result,
+            "total": len(deliveries)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "timeout": DELIVERY_TIMEOUT_MINUTES, "interval": CHECK_INTERVAL_MINUTES})
