@@ -11,14 +11,27 @@ app = Flask(__name__)
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-STORAGE_PROXY_URL = os.getenv("STORAGE_PROXY_URL", "https://storage.vyzo.cloud")
-DELIVERY_TIMEOUT_MINUTES = int(os.getenv("DELIVERY_TIMEOUT_MINUTES", "3"))
+DELIVERY_TIMEOUT_MINUTES = int(os.getenv("DELIVERY_TIMEOUT_MINUTES", "8"))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "1"))
+GALLERY_PROXY_URL = os.getenv("GALLERY_PROXY_URL", "https://storage.vyzo.cloud")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # Store pending deliveries in memory
 pending_deliveries = {}
+
+def refund_credits(user_id, credits_amount):
+    """Refund credits directly via Supabase RPC"""
+    try:
+        response = supabase.rpc('refund_credits', {
+            'p_user_id': user_id,
+            'p_amount': credits_amount
+        }).execute()
+        print(f"[Refund] ✓ Refunded {credits_amount} credits to user {user_id}")
+        return True
+    except Exception as e:
+        print(f"[Refund] ✗ Error refunding credits: {e}")
+        return False
 
 def check_deliveries():
     """Check pending deliveries for images in gallery"""
@@ -45,7 +58,7 @@ def check_deliveries():
         
         try:
             # Check gallery for this specific delivery_id
-            resp = httpx.get(f"{STORAGE_PROXY_URL}/user-gallery?user_id={user_id}", timeout=15)
+            resp = httpx.get(f"{GALLERY_PROXY_URL}/user-gallery?user_id={user_id}", timeout=15)
             
             if resp.status_code == 200:
                 gallery = resp.json()
@@ -107,21 +120,16 @@ def check_deliveries():
         print(f"[Monitor] Error syncing: {e}")
 
 def handle_failure(user_id, credits, delivery_id):
-    """Register error and refund"""
+    """Mark delivery as failed and refund credits"""
     try:
-        # Mark as failed
+        # 1. Mark as failed in Supabase
         supabase.table('deliveries').update({'status': 'failed'}).eq('id', delivery_id).execute()
+        print(f"[Monitor] ✓ Marked delivery {delivery_id} as failed")
         
-        # Call error endpoint
-        httpx.post(f"{STORAGE_PROXY_URL}/user-gallery/error", json={
-            "user_id": user_id,
-            "error_message": "No se recibió imagen en galería personal",
-            "refund_credits": True,
-            "credits_amount": credits,
-            "execution_id": delivery_id
-        }, timeout=15)
+        # 2. Refund credits directly via Supabase RPC
+        refund_credits(user_id, credits)
         
-        print(f"[Monitor] ✓ Refunded {credits} credits for {delivery_id}")
+        print(f"[Monitor] ✓ Delivery {delivery_id} handled successfully")
         
     except Exception as e:
         print(f"[Monitor] Error in handle_failure: {e}")
@@ -139,6 +147,16 @@ def reset():
     global pending_deliveries
     pending_deliveries = {}
     return jsonify({"status": "reset"})
+
+@app.route("/pending")
+def get_pending():
+    """Get list of pending deliveries"""
+    return jsonify({
+        "count": len(pending_deliveries),
+        "deliveries": [
+            {"id": k, **v} for k, v in pending_deliveries.items()
+        ]
+    })
 
 # Start scheduler
 scheduler = BackgroundScheduler()
