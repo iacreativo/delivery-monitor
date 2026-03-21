@@ -43,6 +43,10 @@ def check_deliveries():
         credits = info['credits']
         created = info['created']
         
+        # Ensure created is timezone-aware
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        
         minutes_passed = (now - created).total_seconds() / 60
         
         # Check if enough time passed
