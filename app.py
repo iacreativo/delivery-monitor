@@ -39,11 +39,16 @@ def refund_credits(user_id, credits_amount):
 def cleanup_orphan_deliveries():
     """Clean up deliveries stuck in pending/processing for too long"""
     try:
-        # Get all pending/processing deliveries from the last 2 hours
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+        # Get all pending/processing deliveries from the last 24 hours (catch old stuck deliveries)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
         
         response = supabase.table('deliveries').select('*').in_('status', ['pending', 'processing']).gte('created_at', cutoff.isoformat()).execute()
         deliveries = response.data or []
+        
+        # Also check for very old deliveries (5+ hours) - query without date filter
+        if len(deliveries) == 0:
+            response = supabase.table('deliveries').select('*').in_('status', ['pending', 'processing']).execute()
+            deliveries = response.data or []
         
         for d in deliveries:
             delivery_id = d['id']
