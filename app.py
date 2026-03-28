@@ -90,9 +90,30 @@ def cleanup_orphan_deliveries():
                         found = any(img.get('delivery_id') == delivery_id for img in gallery)
                         
                         if not found:
-                            print(f"[Cleanup] Orphan {delivery_id}: NO image found - failing")
-                            processed_failures.add(delivery_id)
-                            handle_failure(user_id, credits, delivery_id)
+                            # CRITICAL: Check current status in Supabase BEFORE assuming failure
+                            # This prevents false positives when user deletes image after successful delivery
+                            try:
+                                current = supabase.table('deliveries').select('status').eq('id', delivery_id).execute()
+                                if current.data and len(current.data) > 0:
+                                    current_status = current.data[0].get('status')
+                                    # If already completed/delivered/failed, do NOT refund
+                                    if current_status in ('completed', 'delivered', 'failed'):
+                                        print(f"[Cleanup] Orphan {delivery_id} is {current_status} - image deleted by user, no refund")
+                                        processed_failures.add(delivery_id)
+                                        continue
+                                    # Only fail if still pending/processing
+                                    elif current_status in ('pending', 'processing'):
+                                        print(f"[Cleanup] Orphan {delivery_id}: NO image found - failing")
+                                        processed_failures.add(delivery_id)
+                                        handle_failure(user_id, credits, delivery_id)
+                                    else:
+                                        print(f"[Cleanup] Orphan {delivery_id} has unexpected status: {current_status}")
+                                else:
+                                    print(f"[Cleanup] Orphan {delivery_id} not found in DB - skipping")
+                            except Exception as e:
+                                print(f"[Cleanup] Error checking delivery status: {e}")
+                                processed_failures.add(delivery_id)
+                                handle_failure(user_id, credits, delivery_id)
                         else:
                             print(f"[Cleanup] Orphan {delivery_id}: Image found!")
                 except Exception as e:
@@ -144,8 +165,28 @@ def check_deliveries():
                         break
                 
                 if not found:
-                    print(f"[Monitor] ✗ Delivery {delivery_id}: NO image found - FAILING")
-                    handle_failure(user_id, credits, delivery_id)
+                    # CRITICAL: Check current status in Supabase BEFORE assuming failure
+                    # This prevents false positives when user deletes image after successful delivery
+                    try:
+                        current = supabase.table('deliveries').select('status').eq('id', delivery_id).execute()
+                        if current.data and len(current.data) > 0:
+                            current_status = current.data[0].get('status')
+                            # If already completed/delivered/failed, do NOT refund - image was deleted by user post-delivery
+                            if current_status in ('completed', 'delivered', 'failed'):
+                                print(f"[Monitor] Delivery {delivery_id} is {current_status} - image deleted by user, no refund")
+                                del pending_deliveries[delivery_id]
+                                continue
+                            # Only fail if still pending/processing (truly stuck)
+                            elif current_status in ('pending', 'processing'):
+                                print(f"[Monitor] ✗ Delivery {delivery_id}: NO image found after timeout - FAILING")
+                                handle_failure(user_id, credits, delivery_id)
+                            else:
+                                print(f"[Monitor] Delivery {delivery_id} has unexpected status: {current_status}")
+                        else:
+                            print(f"[Monitor] Delivery {delivery_id} not found in DB - skipping")
+                    except Exception as e:
+                        print(f"[Monitor] Error checking delivery status: {e}")
+                        handle_failure(user_id, credits, delivery_id)
                 else:
                     # Remove from pending
                     del pending_deliveries[delivery_id]
